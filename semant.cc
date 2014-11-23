@@ -1,5 +1,6 @@
 #include <stdlib.h>
 #include <stdio.h>
+
 #include <stdarg.h>
 #include "semant.h"
 #include "utilities.h"
@@ -8,7 +9,7 @@
 #include <sstream>
 #include <set>
 
-#define PRINTLN(x) if(0)std::cout<<x<<std::endl
+#define PRINTLN(x) if(1)std::cout<<x<<std::endl
 extern int semant_debug;
 extern char *curr_filename;
 
@@ -92,13 +93,11 @@ ClassTable::ClassTable(Classes classes) : semant_errors(0) , error_stream(cerr) 
     for(int i=classes->first(); classes->more(i); i=classes->next(i)){
         auto cls = classes->nth(i);
         Symbol name = cls->get_name();
-        PRINTLN("Found class: " << name);
-        if(classMap.find(name) == classMap.end()) // class not defined
+        if(name != SELF_TYPE && classMap.find(name) == classMap.end()) // class not defined
             classMap[name] = cls;
         else // error in redefined class
             semant_error(cls) << "ERROR: class redefined" << std::endl;
     }
-    PRINTLN("Total number of class: " << classMap.size());
 
     // check Main class and main method
     if(classMap.find(Main) != classMap.end()){
@@ -120,20 +119,16 @@ ClassTable::ClassTable(Classes classes) : semant_errors(0) , error_stream(cerr) 
         saw.insert(cur->get_name());
         while(cur->get_name() != Object){
             Symbol par_name = cur->get_parent();
-            if(par_name == SELF_TYPE) break; // hack
+            // hack: parent cannot be self
+            if(par_name == SELF_TYPE) break;
             if(classMap.find(par_name) == classMap.end()){
-                std::ostringstream err;
-                err << "Fatal Error: " << cur->get_name() << "'s parent class "
-                    << par_name << " is not defined" << std::endl;
-                fatal_error((char*)(err.str().c_str())); // wired
-                // semant_error(curm->lookup(c)) << "parent class is not defined" << std::endl;
+                semant_error(cur) << " inherits from an undefined class " << par_name << std::endl;
                 break;
             } else if(saw.find(par_name) != saw.end()){
-                std::ostringstream err;
-                err << "Fatal Error: " << "circle in " << cur->get_name() << "'s inherits" << std::endl;
-                fatal_error((char*)(err.str().c_str())); // wired
-                // semant_error(classMap[par_name]m->lookup(c)) << "circle in class hireichy" << std::endl;
-                break;
+                char err[100];
+                std::sprintf(err, "Fatal Error: circle in %s's class hirerarchy",
+                             cur->get_name()->get_string());
+                fatal_error(err); //exit(1);
             } else {
                 saw.insert(par_name);
                 cur = classMap[par_name];
@@ -251,19 +246,41 @@ void ClassTable::install_basic_classes() {
     classMap[Str] = Str_class;
 }
 
-// Class_ ClassTable::operator[](Symbol name){ return classMap[name]; }
-Class_ ClassTable::lookup(Symbol name){
-    if(classMap.find(name) == classMap.end())
+Class_ ClassTable::lookup(Symbol cls){
+    if(classMap.find(cls) == classMap.end())
         return nullptr;
     else
-        return classMap[name];
+        return classMap[cls];
+}
+
+Feature_class* ClassTable::lookup(Symbol cls, Symbol name){
+    if(classMap.find(cls) == classMap.end())
+        return nullptr;
+    auto fs = classMap[cls]->get_features();
+    for(int i=fs->first(); fs->more(i); i=fs->next(i)){
+        auto f = fs->nth(i);
+        if(f->get_name() == name)
+            return f;
+    }
+    return nullptr;
 }
 
 bool ClassTable::leq(const Symbol c, const Symbol p) {
     Symbol t = c;
-    while(t != Object && t != p)
+    while(t != SELF_TYPE && t != Object && t != p)
         t = classMap[t]->get_parent();
     return t == p;
+}
+
+bool ClassTable::leq(const Symbol c, const Symbol p, const Symbol cls) {
+    if(c == SELF_TYPE && p == SELF_TYPE)
+        return true;
+    else if(c == SELF_TYPE)
+        return leq(cls, p);
+    else if(p == SELF_TYPE)
+        return false;
+    else
+        return leq(c, p);
 }
 
 Symbol ClassTable::lub(const Symbol a, const Symbol b) {
@@ -297,24 +314,27 @@ Symbol branch_class::tc(SymTable *o, ClassTableP m, Symbol c){
     o->addid(this->name, this->type_decl);
     Symbol t = this->expr->tc(o, m, c);
     o->exitscope();
-    // this->type = t;
-    // return this->type;
     return t;
 }
 
 Symbol typcase_class::tc(SymTable *o, ClassTableP m, Symbol c){
     Symbol te = this->expr->tc(o, m, c); // unused
-    std::set<Symbol> cts;
-    for(int i = cases->first(); cases->more(i); i = cases->next(i)){
+    std::set<Symbol> decls, acts;
+    for(int i=cases->first(); cases->more(i); i=cases->next(i)){
         auto cas = cases->nth(i);
-        Symbol t = cas->tc(o, m, c);
-        if(cts.find(t) == cts.end())
-            cts.insert(t);
+        Symbol decl = cas->get_type();
+        Symbol actural = cas->tc(o, m, c);
+        if(!m->leq(actural, decl, c))
+            m->semant_error(m->lookup(c)) << "typcase not match" << std::endl;
+        acts.insert(actural);
+        if(decls.find(decl) == decls.end())
+            decls.insert(decl);
         else
             m->semant_error(m->lookup(c)) << "typcase duplicate branch type" << std::endl;
     }
+    // lub all
     Symbol t = nullptr;
-    for(auto ct : cts)
+    for(auto ct : acts)
         if(t == nullptr) t = ct;
         else t = m->lub(t, ct);
     this->type = t;
@@ -330,7 +350,7 @@ Symbol assign_class::tc(SymTable *o, ClassTableP m, Symbol c){
     // NOTE if there is old type, check leq
     if(o->lookup(this->name) != nullptr){
         Symbol oldt = o->lookup(this->name);
-        if(!m->leq(newt, oldt))
+        if(!m->leq(newt, oldt, c))
             m->semant_error(m->lookup(c)) << "assign" << std::endl;
     }
     this->type = newt;
@@ -358,7 +378,7 @@ Symbol static_dispatch_class::tc(SymTable *o, ClassTableP m, Symbol c){
     // t0 == self
     if(t0 == SELF_TYPE) t0 = c; // NOTE
     // check t0 <= T
-    if(!m->leq(t0, this->type_name)){
+    if(!m->leq(t0, this->type_name, c)){
         m->semant_error(m->lookup(c)) << "static_dispatch, not static?" << std::endl;
         t0 = this->type_name;
     }
@@ -368,30 +388,31 @@ Symbol static_dispatch_class::tc(SymTable *o, ClassTableP m, Symbol c){
         pts.push_back(actual->nth(i)->tc(o, m, c));
     }
     // lookup method and check
-    if(m->lookup(t0) == nullptr){
-        m->semant_error(m->lookup(c)) << "static_dispatch, cannot find class " << t0 << std::endl;
-        this->type = Object; // NOTE
-        return this->type;
-    }
-    auto fs = m->lookup(t0)->get_features();
+    Symbol cur_cls = t0;
     method_class *meth = nullptr;
-    for(int i=fs->first(); fs->more(i); i=fs->next(i)){
-        auto f = fs->nth(i);
-        if(f->is_method() && f->get_name() == this->name)
+    while(m->lookup(cur_cls) != nullptr){
+        auto f = m->lookup(cur_cls, this->name);
+        if(f != nullptr && f->is_method()){
             meth = dynamic_cast<method_class *>(f);
+            break;
+        } else {
+            // TODO is_attr
+            if(cur_cls == Object) break;
+            cur_cls = m->lookup(cur_cls)->get_parent();
+        }
     }
     if(meth == nullptr){
-        m->semant_error(m->lookup(c)) << "static_dispatch, cannot find method " << name << " " << t0 << std::endl;
+        m->semant_error(m->lookup(c)) << "staticdispatch, cannot find method " << name << " of " << t0 << std::endl;
         this->type = Object; // NOTE
         return this->type;
     }
     // check method formals
     auto formals = meth->get_formals();
     bool ok = pts.size() == static_cast<size_t>(formals->len());
+    // PRINTLN("STATIC_DISPATCH " << pts.size() << " " << formals->len());
     auto it = pts.begin();
-    for(int i=formals->first(); ok && formals->more(i); i=formals->next(i)){
-        ok = m->leq(*it, formals->nth(i)->get_type());
-    }
+    for(int i=formals->first(); ok && formals->more(i); ++it, i=formals->next(i))
+        ok = m->leq(*it, formals->nth(i)->get_type(), c);
     if(!ok){
         m->semant_error(m->lookup(c)) << "static_dispatch, parameters types not match" << std::endl;
         this->type = Object; // NOTE
@@ -415,20 +436,21 @@ Symbol dispatch_class::tc(SymTable *o, ClassTableP m, Symbol c){
         pts.push_back(actual->nth(i)->tc(o, m, c));
     }
     // lookup method and check
-    if(m->lookup(t0) == nullptr){
-        m->semant_error(m->lookup(c)) << "dispatch, cannot find class " << t0 << std::endl;
-        this->type = Object; // NOTE
-        return this->type;
-    }
-    auto fs = m->lookup(t0)->get_features();
+    Symbol cur_cls = t0;
     method_class *meth = nullptr;
-    for(int i=fs->first(); fs->more(i); i=fs->next(i)){
-        auto f = fs->nth(i);
-        if(f->is_method() && f->get_name() == this->name)
+    while(m->lookup(cur_cls) != nullptr){
+        auto f = m->lookup(cur_cls, this->name);
+        if(f != nullptr && f->is_method()){
             meth = dynamic_cast<method_class *>(f);
+            break;
+        } else {
+            // TODO is_attr
+            if(cur_cls == Object) break;
+            cur_cls = m->lookup(cur_cls)->get_parent();
+        }
     }
     if(meth == nullptr){
-        m->semant_error(m->lookup(c)) << "dispatch, cannot find method " << name << " " << t0 << std::endl;
+        m->semant_error(m->lookup(c)) << "dispatch, cannot find method " << name << " of " << t0 << std::endl;
         this->type = Object; // NOTE
         return this->type;
     }
@@ -437,12 +459,11 @@ Symbol dispatch_class::tc(SymTable *o, ClassTableP m, Symbol c){
     bool ok = pts.size() == static_cast<size_t>(formals->len());
     // PRINTLN("DIS " << pts.size() << " " << formals->len());
     auto it = pts.begin();
-    for(int i=formals->first(); ok && formals->more(i); i=formals->next(i)){
-        ok = m->leq(*it, formals->nth(i)->get_type());
-        ++it;
-    }
+    for(int i=formals->first(); ok && formals->more(i); ++it, i=formals->next(i))
+        ok = m->leq(*it, formals->nth(i)->get_type(), c);
     if(!ok){
-        m->semant_error(m->lookup(c)) << "dispatch, parameters types not match" << std::endl;
+        m->semant_error(m->lookup(c)) << "dispatch, class " << c << " method " << name
+                                      << " parameters types not match" << std::endl;
         this->type = Object; // NOTE
         return this->type;
     }
@@ -477,13 +498,13 @@ Symbol block_class::tc(SymTable *o, ClassTableP m, Symbol c){
 }
 
 Symbol let_class::tc(SymTable *o, ClassTableP m, Symbol c){
+    if(this->identifier == self)
+        m->semant_error(m->lookup(c)) << "'self' cannot be bound in a 'let' expression" << std::endl;
     Symbol t0 = this->type_decl;
-    if(t0 == SELF_TYPE)
-        t0 = c;
-    if(m->lookup(t0) == nullptr)
+    if(t0 != SELF_TYPE && m->lookup(t0) == nullptr)
         m->semant_error(m->lookup(c)) << "let not found class " << t0 << std::endl;
     Symbol t1 = this->init->tc(o, m, c);
-    if(t1 != No_type && !m->leq(t1, t0)) // no init
+    if(t1 != No_type && !m->leq(t1, t0, c)) // no init
         m->semant_error(m->lookup(c)) << "let not leq" <<std::endl;
     o->enterscope();
     o->addid(this->identifier, t0);
@@ -569,7 +590,9 @@ Symbol eq_class::tc(SymTable *o, ClassTableP m, Symbol c){
     Symbol t1 = this->e1->tc(o, m, c);
     Symbol t2 = this->e2->tc(o, m, c);
     // check
-    if(!((t1 == Int && t2 == Int) || (t1 == Bool && t2 == Bool)))
+    // if(!((t1 == Int && t2 == Int) || (t1 == Bool && t2 == Bool)))
+    if((t1 == Int && t2 != Int) || (t1 != Int && t2 == Int) ||
+       (t1 == Bool && t2 != Bool) || (t1 != Bool && t2 == Bool))
         m->semant_error(m->lookup(c)) << "eq" <<std::endl;
     // return type
     this->type = Bool;
@@ -628,11 +651,28 @@ Symbol no_expr_class::tc(SymTable *o, ClassTableP m, Symbol c){
 Symbol object_class::tc(SymTable *o, ClassTableP m, Symbol c){
     if(this->name == self){
         this->type = SELF_TYPE;
-    } else if(o->lookup(this->name) == nullptr){
-        m->semant_error(m->lookup(c)) << "object " << this->name << " not found" <<std::endl;
-        this->type = Object;
-    } else
+    } else if(o->lookup(this->name) != nullptr){ // lookup in table
         this->type = o->lookup(this->name);
+    } else { // lookup in inherits
+        Symbol cur_cls = c;
+        Symbol t = nullptr;
+        while(m->lookup(cur_cls) != nullptr){
+            auto f = m->lookup(cur_cls, this->name);
+            if(f != nullptr && f->is_attr()){
+                t = f->get_type();
+                break;
+            } else {
+                // TODO is_attr
+                if(cur_cls == Object) break;
+                cur_cls = m->lookup(cur_cls)->get_parent();
+            }
+        }
+        if(t == nullptr){
+            m->semant_error(m->lookup(c)) << "object " << this->name << " not found" <<std::endl;
+            this->type = Object;
+        } else
+            this->type = t;
+    }
     return this->type;
 }
 ////////////////////////////////////////////////////////////////////
@@ -672,31 +712,34 @@ Symbol method_class::tc(SymTable *o, ClassTableP m, Symbol c){
     o->enterscope();
     for(int i=formals->first(); formals->more(i); i=formals->next(i)){
         auto f = formals->nth(i);
-        if(f->get_name() == self)
-            m->semant_error(m->lookup(c)) << "'self' cannot be the name of a formal parameter." << std::endl;
         o->addid(f->get_name(), f->get_type());
     }
     Symbol t = this->expr->tc(o, m, c);
     o->exitscope();
+    if(!m->leq(t, return_type, c))
+        m->semant_error(m->lookup(c)) << "Inferred return type " << return_type
+                                      << " of method h does not conform to declared return type "
+                                      << t << "." << std::endl;
     return return_type;
 }
 
 Symbol attr_class::tc(SymTable *o, ClassTableP m, Symbol c){
     Symbol t = init->tc(o, m, c);
-    if(t != No_type && !(m->leq(t, type_decl)))
+    if(t == SELF_TYPE)
+        return c;
+    if(t != No_type && !(m->leq(t, type_decl, c)))
         m->semant_error(m->lookup(c)) << "attr type not match" << std::endl;
     return type_decl;
 }
 
 void class__class::tc(SymTable *o, ClassTableP m){
-    if(parent == SELF_TYPE)
-        m->semant_error(this) << "Class " << name << " cannot inherit class SELF_TYPE." << std::endl;
-    if(parent == Bool)
-        m->semant_error(this) << "Class " << name << " cannot inherit class Bool." << std::endl;
-    if(parent == Int)
-        m->semant_error(this) << "Class " << name << " cannot inherit class Int." << std::endl;
-    if(parent == Str)
-        m->semant_error(this) << "Class " << name << " cannot inherit class Str." << std::endl;
+    // check bad parents
+    auto bad_parents = std::vector<Symbol>{SELF_TYPE, Bool, Int, Str};
+    for(auto tp : bad_parents)
+        if(parent == tp)
+            m->semant_error(this) << "Class " << name << " cannot inherit class "
+                                  << tp << "." << std::endl;
+    // check duplicates attr or method
     std::set<Symbol> saw;
     o->enterscope();
     // add all attrs in symbol table
@@ -709,6 +752,71 @@ void class__class::tc(SymTable *o, ClassTableP m){
         }
         if(f->is_attr())
             o->addid(f->get_name(), f->get_type());
+        // check duplicate formals
+        else{
+            auto fs = dynamic_cast<method_class *>(f)->get_formals();
+            std::set<Symbol> saw_formal;
+            for(int i=fs->first(); fs->more(i); i=fs->next(i)){
+                Symbol nm = fs->nth(i)->get_name();
+                if(fs->nth(i)->get_type() == SELF_TYPE)
+                    m->semant_error(this) << "Formal parameter " << nm << " cannot have type SELF_TYPE." << std::endl;
+                if(nm == self)
+                    m->semant_error(this) << "'self' cannot be the name of a formal parameter." << std::endl;
+                else if(saw_formal.find(nm) != saw_formal.end())
+                    m->semant_error(this) << "Formal parameter " << nm << " is multiply defined." << std:: endl;
+                else
+                    saw_formal.insert(nm);
+            }
+        }
+        // check override
+        auto cur = parent;
+        while(1){
+            if(m->lookup(cur) == nullptr) break;
+            auto pf = m->lookup(cur, f->get_name());
+            if(pf != nullptr){
+                if(f->get_name() == pf->get_name()){
+                    if(f->is_attr() && pf->is_method()){
+                        m->semant_error(this) << "Attribute " << f->get_name()
+                                              << " is an method of an inherited class." << std::endl;
+                        break;
+                    }else if(f->is_method() && pf->is_attr()){
+                        m->semant_error(this) << "Method " << f->get_name()
+                                              << " is an attribute of an inherited class." << std::endl;
+                        break;
+                    }else if(f->is_attr() && pf->is_attr()){
+                        m->semant_error(this) << "Attribute " << f->get_name()
+                                              << " is an attribute of an inherited class." << std::endl;
+                        break;
+                    }else if(f->is_method() && pf->is_method()){
+                        // check formals
+                        auto fs1 = dynamic_cast<method_class *>(f)->get_formals();
+                        auto fs2 = dynamic_cast<method_class *>(pf)->get_formals();
+                        bool len_ok = fs1->len() == fs2->len();
+                        bool ok = len_ok;
+                        Symbol tnew, told;
+                        for(int i=fs1->first(), j=fs2->first();
+                            ok && fs1->more(i) && fs2->more(j);
+                            i=fs1->next(i), j=fs2->next(j)){
+                            tnew = fs1->nth(i)->get_type();
+                            told = fs2->nth(j)->get_type();
+                            ok = tnew == told;
+                        }
+                        if(!len_ok){
+                            m->semant_error(this) << "Incompatible number of formal parameters in redefined method "
+                                                  << f->get_name() << std::endl;
+                            break;
+                        }else if(!ok){
+                            m->semant_error(this) << "In redefined method " << f->get_name()
+                                                  << " parameter type " << tnew << " is different from original type "
+                                                  << told << std::endl;
+                            break;
+                        }
+                    }
+                }
+            }
+            if(cur == Object) break;
+            else cur = m->lookup(cur)->get_parent();
+        }
     }
     // infer type for all features
     for(int i=features->first(); features->more(i); i=features->next(i)){

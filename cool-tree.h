@@ -107,6 +107,7 @@ class Case_class : public tree_node {
 public:
    tree_node *copy()		 { return copy_Case(); }
    virtual Case copy_Case() = 0;
+   virtual Symbol get_type() = 0;
    virtual Symbol tc(SymTable *o, ClassTableP m, Symbol c) = 0;
 
 #ifdef Case_EXTRAS
@@ -294,6 +295,7 @@ public:
    }
    Case copy_Case();
    void dump(ostream& stream, int n);
+   Symbol get_type() { return type_decl; }
    Symbol tc(SymTable *o, ClassTableP m, Symbol c);
 
 #ifdef Case_SHARED_EXTRAS
