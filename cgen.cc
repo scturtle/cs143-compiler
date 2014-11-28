@@ -28,16 +28,16 @@
 int tag_cnt = 0;
 int label_cnt = 0;
 int tmp_cnt = 0;
-int max(int a, int b) { return a >= b ? a : b; }
-int new_label() { return label_cnt++; }
-int new_tmp() { return tmp_cnt++; }
-void release_tmp() { --tmp_cnt; }
 CgenNodeP cur_nd;
 CgenClassTableP class_table;
 SymbolTable<Symbol, int> tmp_table;
 
+int max(int a, int b) { return a >= b ? a : b; }
+int new_label() { return label_cnt++; }
+
+
 // lookup name in locals and current class's attrs
-std::pair<char *, int> lookup(Symbol name) {
+std::pair<char *, int> lookup_var(Symbol name) {
     int *loc = tmp_table.lookup(name);
     if (loc == nullptr)
         return std::make_pair((char *)SELF, cur_nd->get_attr_offset(name));
@@ -359,7 +359,7 @@ static void emit_func_before(int tmps, ostream &s) {
     emit_store(FP, 3 + tmps, SP, s);
     emit_store(SELF, 2 + tmps, SP, s);
     emit_store(RA, 1 + tmps, SP, s);
-    emit_addiu(FP, SP, WORD_SIZE, s); // fp point to return addr
+    emit_addiu(FP, SP, WORD_SIZE, s);
     emit_move(SELF, ACC, s);
 }
 
@@ -641,6 +641,7 @@ CgenClassTable::CgenClassTable(Classes classes, ostream &s)
     enterscope();
     if (cgen_debug)
         cout << "Building CgenClassTable" << endl;
+
     install_basic_classes();
     install_classes(classes);
     build_inheritance_tree();
@@ -830,7 +831,7 @@ void CgenNode::set_parentnd(CgenNodeP p) {
 int CgenNode::get_meth_offset(Symbol meth_name) {
     // in disptable
     int offset = 0;
-    for (auto pr : meths)
+    for (auto &pr : meths)
         if (pr.first == meth_name)
             return offset;
         else
@@ -840,8 +841,8 @@ int CgenNode::get_meth_offset(Symbol meth_name) {
 
 int CgenNode::get_attr_offset(Symbol attr_name) {
     // in stack
-    int offset = 3;
-    for (auto attr : attrs)
+    int offset = DEFAULT_OBJFIELDS;
+    for (auto &attr : attrs)
         if (attr->get_name() == attr_name)
             return offset;
         else
@@ -870,11 +871,12 @@ void CgenClassTable::gen_obj_tab(CgenNodeP nd) {
 }
 
 void CgenClassTable::lookup_features(CgenNodeP nd) {
+    // from parent
     if (nd->get_name() != Object) {
         auto pnd = nd->get_parentnd();
         for (auto f : pnd->meths)
-            nd->meths.push_back(f); // ugly copy
-        for (auto f : pnd->attrs)
+            nd->meths.push_back(f);
+        for (auto &f : pnd->attrs)
             nd->attrs.push_back(f);
     }
     auto fs = nd->get_features();
@@ -898,32 +900,26 @@ void CgenClassTable::lookup_features(CgenNodeP nd) {
         lookup_features(c->hd());
 }
 
-void CgenClassTable::gen_disp_tab(List<CgenNode> *l) {
-    if (l == nullptr)
-        return;
-    gen_disp_tab(l->tl());
-    auto nd = l->hd();
+void CgenClassTable::gen_disp_tab(CgenNodeP nd) {
     emit_disptable_ref(nd->get_name(), str);
     str << LABEL;
-    for (auto pr : nd->meths) {
+    for (auto &pr : nd->meths) {
         str << WORD;
         emit_method_ref(pr.second, pr.first, str);
         str << endl;
     }
+    for (auto c = nd->get_children(); c; c = c->tl())
+        gen_disp_tab(c->hd());
 }
 
-void CgenClassTable::gen_prot_obj(List<CgenNode> *l) {
-    if (l == nullptr)
-        return;
-    gen_prot_obj(l->tl());
-    auto nd = l->hd();
+void CgenClassTable::gen_prot_obj(CgenNodeP nd) {
     str << WORD << "-1" << endl; // eye
     emit_protobj_ref(nd->get_name(), str);
-    str << LABEL << WORD << nd->tag << endl << WORD << 3 + nd->attrs.size()
-        << endl << WORD;
+    str << LABEL << WORD << nd->tag << endl << WORD
+        << DEFAULT_OBJFIELDS + nd->attrs.size() << endl << WORD;
     emit_disptable_ref(nd->get_name(), str);
     str << endl;
-    for (auto attr : nd->attrs) {
+    for (auto &attr : nd->attrs) {
         str << WORD;
         if (attr->get_type() == Int)
             inttable.lookup_string("0")->code_ref(str);
@@ -935,17 +931,14 @@ void CgenClassTable::gen_prot_obj(List<CgenNode> *l) {
             str << 0;
         str << endl;
     }
+    for (auto c = nd->get_children(); c; c = c->tl())
+        gen_prot_obj(c->hd());
 }
 
-void CgenClassTable::gen_init(List<CgenNode> *l) {
-    if (l == nullptr)
-        return;
-    gen_init(l->tl());
-    auto nd = l->hd();
-
+void CgenClassTable::gen_init(CgenNodeP nd) {
     // max tmps for all attrs
     int tmps = 0;
-    for (auto attr : nd->attrs)
+    for (auto &attr : nd->attrs)
         tmps = max(tmps, attr->get_expr()->cnt_max_tmps());
     emit_init_ref(nd->get_name(), str);
     str << LABEL;
@@ -957,15 +950,17 @@ void CgenClassTable::gen_init(List<CgenNode> *l) {
         str << endl;
     }
     // each attr's init
-    int offset = 2;
-    for (auto attr : nd->attrs) {
+    int offset = DEFAULT_OBJFIELDS - 1;
+    for (auto &attr : nd->attrs) {
         ++offset;
+        // no init or already in parent's init
         if (attr->get_expr()->is_no_expr())
             continue;
         auto pnt_attrs = nd->get_parentnd()->attrs;
         if (find(pnt_attrs.begin(), pnt_attrs.end(), attr) != pnt_attrs.end())
             continue;
 
+        // before codegen
         cur_nd = nd;
         tmp_table.enterscope();
         tmp_cnt = 0;
@@ -978,46 +973,48 @@ void CgenClassTable::gen_init(List<CgenNode> *l) {
     }
     emit_move(ACC, SELF, str);
     emit_func_after(tmps, 0, str);
+
+    for (auto c = nd->get_children(); c; c = c->tl())
+        gen_init(c->hd());
 }
 
-void CgenClassTable::gen_meth(List<CgenNode> *l) {
-    if (l == nullptr)
-        return;
-    gen_meth(l->tl());
-    auto nd = l->hd();
+void CgenClassTable::gen_meth(CgenNodeP nd) {
     // don't gen method for basic class, they are in library
-    if (nd->basic())
-        return;
+    if (nd->basic() == false) {
+        auto fs = nd->get_features();
+        for (int i = fs->first(); fs->more(i); i = fs->next(i)) {
 
-    auto fs = nd->get_features();
-    for (int i = fs->first(); fs->more(i); i = fs->next(i)) {
+            if (fs->nth(i)->is_method() == false)
+                continue;
+            auto f = dynamic_cast<method_class *>(fs->nth(i));
 
-        if (fs->nth(i)->is_method() == false)
-            continue;
-        auto f = dynamic_cast<method_class *>(fs->nth(i));
+            int tmps = f->get_expr()->cnt_max_tmps();
 
-        int tmps = f->get_expr()->cnt_max_tmps();
-        emit_method_ref(nd->get_name(), f->get_name(), str);
-        str << LABEL;
-        emit_func_before(tmps, str);
+            emit_method_ref(nd->get_name(), f->get_name(), str);
+            str << LABEL;
+            emit_func_before(tmps, str);
 
-        cur_nd = nd;
-        tmp_table.enterscope();
-        tmp_cnt = 0;
+            // before gen
+            cur_nd = nd;
+            tmp_table.enterscope();
+            tmp_cnt = 0;
 
-        // build formal offset map
-        auto fms = f->get_formals();
-        // stack: H[formal1, formal2, tmps, fp, so, ra(new_fp)]L
-        int offset = fms->len() + tmps + 2;
-        for (int i = fms->first(); fms->more(i); i = fms->next(i))
-            tmp_table.addid(fms->nth(i)->get_name(), new int { offset-- });
+            // build formal offset map
+            auto fms = f->get_formals();
+            // stack: High[fm1, fm2, fp, so, ra, tmp2, tmp1(new_fp)]Low(top)
+            int offset = fms->len() + tmps + 2;
+            for (int i = fms->first(); fms->more(i); i = fms->next(i))
+                tmp_table.addid(fms->nth(i)->get_name(), new int { offset-- });
 
-        f->get_expr()->code(str);
+            f->get_expr()->code(str);
 
-        tmp_table.exitscope();
+            tmp_table.exitscope();
 
-        emit_func_after(tmps, fms->len(), str);
+            emit_func_after(tmps, fms->len(), str);
+        }
     }
+    for (auto c = nd->get_children(); c; c = c->tl())
+        gen_meth(c->hd());
 }
 
 void CgenClassTable::code() {
@@ -1040,17 +1037,16 @@ void CgenClassTable::code() {
     //
 
     str << CLASSNAMETAB << LABEL;
-    // gen_name_tab(nds);
     gen_name_tab(root());
 
     str << CLASSOBJTAB << LABEL;
     gen_obj_tab(root());
 
-    // build meths and attrs recursively for each nd
+    // build meths and attrs recursively for each class
     lookup_features(root());
 
-    gen_disp_tab(nds);
-    gen_prot_obj(nds);
+    gen_disp_tab(root());
+    gen_prot_obj(root());
 
     if (cgen_debug)
         cout << "coding global text" << endl;
@@ -1063,8 +1059,9 @@ void CgenClassTable::code() {
 
     // global class table for lookup tag or something
     class_table = this;
-    gen_init(nds);
-    gen_meth(nds);
+
+    gen_init(root());
+    gen_meth(root());
 }
 
 CgenNodeP CgenClassTable::root() { return probe(Object); }
@@ -1094,7 +1091,7 @@ CgenNode::CgenNode(Class_ nd, Basicness bstatus, CgenClassTableP ct)
 
 void assign_class::code(ostream &s) {
     expr->code(s);
-    auto pr = lookup(name);
+    auto pr = lookup_var(name);
     emit_store(ACC, pr.second, pr.first, s);
 }
 
@@ -1118,8 +1115,7 @@ void static_dispatch_class::code(ostream &s) {
     emit_load_imm(T1, cur_nd->get_line_number(), s);
     emit_jal("_dispatch_abort", s);
     emit_label_def(ok, s);
-    // load disptable
-    // emit_load(T1, DISPTABLE_OFFSET, ACC, s);
+    // load static disptable
     s << LA << T1 << " ";
     emit_disptable_ref(type_name, s);
     s << endl;
@@ -1210,9 +1206,10 @@ int loop_class::cnt_max_tmps() {
 }
 
 void typcase_class::code(ostream &s) {
-    expr->code(s);
     int end = new_label();
     int cur = new_label(), nxt;
+    expr->code(s);
+    // void?
     emit_bne(ACC, ZERO, cur, s);
     // filename in a0
     emit_load_string(
@@ -1246,8 +1243,6 @@ void typcase_class::code(ostream &s) {
         // min and max tag
         auto nd = class_table->probe(cas->get_type());
         int min_tag = nd->tag;
-        // tag of the left most one
-        // while(nd->get_children()) nd = nd->get_children()->hd();
         // tag of the right most one
         while (nd->get_children())
             for (auto c = nd->get_children(); c; c = c->tl())
@@ -1256,15 +1251,15 @@ void typcase_class::code(ostream &s) {
         emit_blti(T2, min_tag, nxt, s);
         emit_bgti(T2, max_tag, nxt, s);
         // tag match, add into tmp table
-        tmp_table.addid(cas->get_name(), new int { new_tmp() });
-        auto pr = lookup(cas->get_name());
+        tmp_table.addid(cas->get_name(), new int { tmp_cnt++ });
+        auto pr = lookup_var(cas->get_name());
         emit_store(ACC, pr.second, pr.first, s);
         cas->get_expr()->code(s);
         // jump to the end
         emit_branch(end, s);
         cur = nxt;
         tmp_table.exitscope();
-        release_tmp();
+        --tmp_cnt;
     }
     // final case for no match
     emit_label_def(nxt, s);
@@ -1293,6 +1288,7 @@ int block_class::cnt_max_tmps() {
 
 void let_class::code(ostream &s) {
     if (init->is_no_expr()) {
+        // default value
         if (type_decl == Int)
             emit_load_int(ACC, inttable.lookup_string("0"), s);
         else if (type_decl == Bool)
@@ -1300,16 +1296,16 @@ void let_class::code(ostream &s) {
         else if (type_decl == Str)
             emit_load_string(ACC, stringtable.lookup_string(""), s);
         else
-            emit_move(ACC, ZERO, s);
+            emit_move(ACC, ZERO, s); // void
     } else
         init->code(s);
     tmp_table.enterscope();
-    tmp_table.addid(identifier, new int { new_tmp() });
-    auto pr = lookup(identifier);
+    tmp_table.addid(identifier, new int { tmp_cnt++ });
+    auto pr = lookup_var(identifier);
     emit_store(ACC, pr.second, pr.first, s);
     body->code(s);
     tmp_table.exitscope();
-    release_tmp();
+    --tmp_cnt;
 }
 
 int let_class::cnt_max_tmps() {
@@ -1480,13 +1476,13 @@ int bool_const_class::cnt_max_tmps() { return 0; }
 void new__class::code(ostream &s) {
     if (type_name == SELF_TYPE) {
         emit_load_address(T1, CLASSOBJTAB, s);
-        emit_load(T2, 0, SELF, s); // put tag into t2
-        emit_sll(T2, T2, 3, s);    // tag = tag * 8
+        emit_load(T2, 0, SELF, s);
+        emit_sll(T2, T2, 3, s);    // tag at offset 8
         emit_addu(T1, T1, T2, s);  // the addr of probtobj
-        emit_move("$s1", T1, s);
+        emit_move(T3, T1, s);
         emit_load(ACC, 0, T1, s);
         emit_method_call(Object, ::copy, s);
-        emit_load(T1, 1, "$s1", s); // addr of init
+        emit_load(T1, 1, T3, s); // addr of init
         emit_jalr(T1, s);
     } else if (type_name == Bool)
         emit_load_bool(ACC, falsebool, s);
@@ -1525,12 +1521,10 @@ void no_expr_class::code(ostream &s) {
 int no_expr_class::cnt_max_tmps() { return 0; }
 
 void object_class::code(ostream &s) {
-    // s << "# OBJECT " << name << endl;
     if (name == self)
-        emit_move(ACC, "$s0", s);
+        emit_move(ACC, SELF, s);
     else {
-        auto pr = lookup(name);
-        // s << "#        " << pr.first << " " << pr.second << endl;
+        auto pr = lookup_var(name);
         emit_load(ACC, pr.second, pr.first, s);
     }
 }

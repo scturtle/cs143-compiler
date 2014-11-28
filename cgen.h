@@ -48,10 +48,10 @@ class CgenClassTable : public SymbolTable<Symbol, CgenNode> {
     void gen_name_tab(CgenNodeP nd);
     void gen_obj_tab(CgenNodeP nd);
     void lookup_features(CgenNodeP nd);
-    void gen_disp_tab(List<CgenNode> *l);
-    void gen_prot_obj(List<CgenNode> *l);
-    void gen_init(List<CgenNode> *l);
-    void gen_meth(List<CgenNode> *l);
+    void gen_disp_tab(CgenNodeP nd);
+    void gen_prot_obj(CgenNodeP nd);
+    void gen_init(CgenNodeP nd);
+    void gen_meth(CgenNodeP nd);
 
   public:
     CgenClassTable(Classes, ostream &str);
